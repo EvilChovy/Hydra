@@ -128,6 +128,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   .btn:hover { border-color: var(--accent); color: var(--accent); }
   .btn.active { border-color: var(--green); color: var(--green); background: rgba(48,209,88,0.08); }
+  .btn-wipe { color: var(--red); border-color: var(--border); font-size: 10px; padding: 4px 10px; }
+  .btn-wipe:hover { border-color: var(--red); background: rgba(255,69,58,0.1); color: var(--red); }
 
   /* ── Tabs ── */
   .tabs {
@@ -324,6 +326,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     Errors
     <span class="tab-badge" id="badge-errors">0</span>
   </div>
+  <div style="margin-left:auto;display:flex;align-items:center;padding-right:8px">
+    <button class="btn btn-wipe" onclick="wipeCurrent()">Wipe</button>
+  </div>
 </div>
 
 <div class="filter-bar">
@@ -420,6 +425,28 @@ function esc(s) {
 
 function applyFilter() { renderLogs(); }
 
+async function wipeCurrent() {
+  const names = {'hydra.log':'General','hydra_trades.log':'Trades','hydra_errors.log':'Errors'};
+  const label = names[currentFile] || currentFile;
+  if (!confirm('Borrar log "' + label + '"?\nEl archivo se vaciara por completo.')) return;
+  try {
+    const res = await fetch('/api/wipe', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({file: currentFile})
+    });
+    const data = await res.json();
+    if (data.ok) {
+      logCache[currentFile] = [];
+      renderLogs();
+    } else {
+      alert('Error: ' + (data.error || 'unknown'));
+    }
+  } catch(e) {
+    alert('Error de conexion: ' + e.message);
+  }
+}
+
 async function fetchLogs() {
   try {
     const res = await fetch('/api/logs');
@@ -482,6 +509,42 @@ class LogViewerHandler(BaseHTTPRequestHandler):
             self._serve_logs()
         else:
             self.send_error(404)
+
+    def do_POST(self):
+        if self.path == "/api/wipe":
+            self._wipe_log()
+        else:
+            self.send_error(404)
+
+    def _wipe_log(self):
+        """Clear a specific log file."""
+        allowed = {"hydra.log", "hydra_trades.log", "hydra_errors.log"}
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length > 0 else {}
+            fname = body.get("file", "")
+
+            if fname not in allowed:
+                self._json_response(400, {"ok": False, "error": "Invalid file"})
+                return
+
+            fpath = LOG_DIR / fname
+            if fpath.exists():
+                with open(fpath, "w", encoding="utf-8") as f:
+                    f.truncate(0)
+
+            self._json_response(200, {"ok": True, "file": fname})
+        except Exception as e:
+            self._json_response(500, {"ok": False, "error": str(e)})
+
+    def _json_response(self, code, data):
+        """Send a JSON response."""
+        payload = json.dumps(data).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(payload)
 
     def _serve_html(self):
         self.send_response(200)
