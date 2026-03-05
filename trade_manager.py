@@ -526,7 +526,7 @@ class TradeManager:
         """Calculate exact received quantity after base asset fees, rounded down to precision."""
         exec_qty = float(order.get("executedQty", 0))
         if side == "LONG":
-            base_asset = symbol.replace("USDC", "").replace("USDT", "")
+            base_asset = symbol.replace("USDC", "")
             base_fee = 0.0
             for f in order.get("fills", []):
                 if f.get("commissionAsset") == base_asset:
