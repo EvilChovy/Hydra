@@ -1,0 +1,18 @@
+[Unit]
+Description=HYDRA Log Viewer Web Dashboard
+After=hydra.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/hydra
+ExecStart=/home/pi/hydra/.venv/bin/python log_viewer.py
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hydra-logs
+
+[Install]
+WantedBy=multi-user.target
