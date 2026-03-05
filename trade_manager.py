@@ -108,7 +108,15 @@ class TradeManager:
 
             # Parse fill price from order response
             fill_price = self._parse_fill_price(order)
+            
+            # ── FIX: Calculate actual quantity received after fees ──
+            # Binance deducts fees from the received asset. If we don't subtract
+            # the fee, selling the full quantity later will fail with -2010 Insufficient Balance.
+            actual_qty = self._parse_actual_qty(order, signal.side, symbol, cfg.pair.QTY_PRECISION)
+            
             trade.entry_price = fill_price
+            trade.entry_qty = actual_qty
+            trade.remaining_qty = actual_qty
             trade.entry_order_id = str(order.get("orderId", ""))
             trade.state = TradeState.OPEN.value
 
@@ -514,6 +522,24 @@ class TradeManager:
                 total_fee += fee * 300  # Rough BNB/USDC
         return round(total_fee, 4)
 
+    def _parse_actual_qty(self, order: dict, side: str, symbol: str, precision: int) -> float:
+        """Calculate exact received quantity after base asset fees, rounded down to precision."""
+        exec_qty = float(order.get("executedQty", 0))
+        if side == "LONG":
+            base_asset = symbol.replace("USDC", "").replace("USDT", "")
+            base_fee = 0.0
+            for f in order.get("fills", []):
+                if f.get("commissionAsset") == base_asset:
+                    base_fee += float(f.get("commission", 0))
+            actual_qty = exec_qty - base_fee
+        else:
+            actual_qty = exec_qty
+
+        # Round down to qty_precision to ensure we can sell exactly this amount
+        from decimal import Decimal, ROUND_DOWN
+        quantized = Decimal(str(actual_qty)).quantize(Decimal(10) ** -precision, rounding=ROUND_DOWN)
+        return float(quantized)
+
     def emergency_close_all(self, symbol: str):
         """Emergency: close all open positions for a symbol."""
         logger.critical(f"EMERGENCY CLOSE ALL for {symbol}")
@@ -524,3 +550,78 @@ class TradeManager:
                 self._close_trade(trade, price, "EMERGENCY_CLOSE")
             except Exception as e:
                 logger.critical(f"Failed emergency close for {trade.trade_id}: {e}")
+
+    def kill_switch_liquidate(self):
+        """
+        KILL SWITCH: Liquidate ALL positions and repay ALL margin debt.
+        
+        Steps:
+        1. Close all open trades (any symbol) with AUTO_REPAY
+        2. Cancel all open orders
+        3. Repay any remaining margin debt (interest, residuals)
+        """
+        logger.critical("╔══════════════════════════════════════════════════════╗")
+        logger.critical("║       ⚠️  KILL SWITCH ACTIVATED — LIQUIDATING ALL    ║")
+        logger.critical("╚══════════════════════════════════════════════════════╝")
+
+        cfg = self.config
+
+        # ── Step 1: Close all open trades ──
+        open_trades = self.db.get_open_trades()  # All symbols
+        if open_trades:
+            logger.critical(f"Found {len(open_trades)} open trade(s) — closing all...")
+            for trade in open_trades:
+                try:
+                    # Cancel SL order first
+                    self._cancel_stop_loss(trade)
+                    # Get current price and close
+                    price = self.exchange.get_ticker_price(trade.symbol)
+                    self._close_trade(trade, price, "KILL_SWITCH")
+                    logger.critical(f"  Closed trade {trade.trade_id} @ ${price:.2f}")
+                except Exception as e:
+                    logger.critical(f"  FAILED to close {trade.trade_id}: {e}")
+        else:
+            logger.critical("No open trades found.")
+
+        # ── Step 2: Cancel any remaining open orders ──
+        try:
+            open_orders = self.exchange.get_open_margin_orders(cfg.pair.SYMBOL)
+            if open_orders:
+                logger.critical(f"Cancelling {len(open_orders)} open order(s)...")
+                for order in open_orders:
+                    try:
+                        self.exchange.cancel_margin_order(
+                            symbol=cfg.pair.SYMBOL,
+                            order_id=order.get("orderId"),
+                        )
+                        logger.critical(f"  Cancelled order {order.get('orderId')}")
+                    except Exception as e:
+                        logger.critical(f"  Failed to cancel order: {e}")
+        except Exception as e:
+            logger.critical(f"Failed to fetch open orders: {e}")
+
+        # ── Step 3: Repay remaining margin debt ──
+        try:
+            borrowed_assets = self.exchange.get_all_borrowed_assets()
+            if borrowed_assets:
+                logger.critical(f"Found {len(borrowed_assets)} asset(s) with outstanding debt:")
+                for asset_info in borrowed_assets:
+                    asset = asset_info["asset"]
+                    total = asset_info["total_owed"]
+                    logger.critical(
+                        f"  {asset}: borrowed={asset_info['borrowed']:.8f} "
+                        f"interest={asset_info['interest']:.8f} "
+                        f"total={total:.8f}"
+                    )
+                    try:
+                        self.exchange.repay_margin_loan(asset, total)
+                        logger.critical(f"  ✓ Repaid {total:.8f} {asset}")
+                    except Exception as e:
+                        logger.critical(f"  ✗ Failed to repay {asset}: {e}")
+            else:
+                logger.critical("No outstanding margin debt.")
+        except Exception as e:
+            logger.critical(f"Failed to check/repay margin debt: {e}")
+
+        logger.critical("Kill switch liquidation complete.")
+

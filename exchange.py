@@ -416,6 +416,32 @@ class ExchangeClient:
             qty_precision=qty_precision,
         )
 
+    def repay_margin_loan(self, asset: str, amount: float) -> dict:
+        """Repay a margin loan for a specific asset."""
+        logger.info(f"Repaying margin loan: {amount:.8f} {asset}")
+        return self._request(
+            "POST",
+            "/sapi/v1/margin/repay",
+            {"asset": asset, "amount": f"{amount:.8f}", "isIsolated": "FALSE"},
+        )
+
+    def get_all_borrowed_assets(self) -> list[dict]:
+        """Get all assets with outstanding margin debt (borrowed > 0)."""
+        account = self.get_margin_account()
+        borrowed = []
+        for a in account.get("userAssets", []):
+            borrow_amt = float(a.get("borrowed", 0))
+            interest_amt = float(a.get("interest", 0))
+            if borrow_amt > 0 or interest_amt > 0:
+                borrowed.append({
+                    "asset": a["asset"],
+                    "borrowed": borrow_amt,
+                    "interest": interest_amt,
+                    "total_owed": borrow_amt + interest_amt,
+                    "free": float(a.get("free", 0)),
+                })
+        return borrowed
+
     def get_usdc_equity(self) -> float:
         """Get total USDC equity (net asset value) in margin account."""
         balance = self.get_margin_asset_balance("USDC")

@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  hydra-bot:
+    build: .
+    container_name: hydra_bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Sincroniza tu carpeta local con el contenedor
+      # Así no pierdes la DB de SQLite ni los logs
+      - ./:/app
+    # Ejecutamos el bot (-u fuerza a Python a no guardar en caché los logs)
+    command: ["python", "-u", "main.py"]
+
+  hydra-viewer:
+    build: .
+    container_name: hydra_viewer
+    restart: unless-stopped
+    ports:
+      - "8777:8777"
+    volumes:
+      # Comparte la misma carpeta para que el visor pueda leer /logs/
+      - ./:/app
+    command: ["python", "-u", "log_viewer.py"]

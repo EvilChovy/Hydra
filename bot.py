@@ -5,10 +5,12 @@
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
+import json
 import time
 import logging
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from config import HydraConfig
@@ -49,6 +51,10 @@ class HydraBot:
         self.config = config
         self._running = False
         self._shutdown_event = threading.Event()
+
+        # Kill switch state
+        self._kill_switch_file = Path(__file__).parent / "kill_switch.json"
+        self._kill_switch_already_fired = False
 
         # Core components
         self.exchange = ExchangeClient(config.exchange)
@@ -170,6 +176,12 @@ class HydraBot:
 
         while self._running:
             try:
+                # ── Kill switch check ──
+                if self._read_kill_switch():
+                    logger.warning("⚠️ Kill switch active — scanner paused, no new trades")
+                    self._sleep(10)
+                    continue
+
                 # Daily equity reset check
                 self.risk.set_daily_start_equity()
 
@@ -214,6 +226,18 @@ class HydraBot:
 
         while self._running:
             try:
+                # ── Kill switch check ──
+                if self._read_kill_switch():
+                    if not self._kill_switch_already_fired:
+                        logger.critical("⚠️ Kill switch activated — liquidating all positions!")
+                        self.trade_mgr.kill_switch_liquidate()
+                        self._kill_switch_already_fired = True
+                    self._sleep(10)
+                    continue
+                else:
+                    # Reset flag when kill switch is deactivated
+                    self._kill_switch_already_fired = False
+
                 open_trades = self.db.get_open_trades(self.config.pair.SYMBOL)
 
                 for trade in open_trades:
@@ -308,6 +332,16 @@ class HydraBot:
             )
         except Exception as e:
             logger.error(f"Failed to get account info: {e}")
+
+    def _read_kill_switch(self) -> bool:
+        """Read kill switch state from shared JSON file."""
+        try:
+            if self._kill_switch_file.exists():
+                data = json.loads(self._kill_switch_file.read_text(encoding="utf-8"))
+                return data.get("active", False)
+        except Exception:
+            pass
+        return False
 
     def _sleep(self, seconds: float):
         """Interruptible sleep."""

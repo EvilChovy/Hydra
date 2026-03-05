@@ -43,7 +43,7 @@ PAPER_STARTING_BALANCE_USDC = 1000.0
 #   0.06 = 6%  → Muy agresivo
 #   0.10 = 10% → Máximo permitido (el bot bloquea más de 10%)
 #
-RISK_PER_TRADE = 0.04
+RISK_PER_TRADE = 0.1
 
 # ═══════════════════════════════════════════════════════════════════
 # 4. APALANCAMIENTO
@@ -144,4 +144,4 @@ ENTRY_TIMEFRAME = "5m"    # Opciones: "1m", "3m", "5m", "15m"
 # "INFO"  = muestra operaciones y eventos importantes (recomendado)
 # "WARNING" = solo advertencias y errores
 #
-LOG_LEVEL = "INFO"
+LOG_LEVEL = "DEBUG"

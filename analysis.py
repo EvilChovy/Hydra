@@ -387,10 +387,12 @@ class AnalysisEngine:
         )
 
         if macro_bias == "NEUTRAL":
+            logger.debug("ENTRY SKIP: Macro bias is NEUTRAL")
             return null_signal
 
         if len(ohlcv) < max(macd_slow + macd_signal, atr_period, vol_ma_period) + 5:
             null_signal.reason = "Insufficient data"
+            logger.debug("ENTRY SKIP: Insufficient data")
             return null_signal
 
         # Calculate indicators
@@ -415,6 +417,7 @@ class AnalysisEngine:
 
         if np.isnan(cur_rsi) or np.isnan(cur_atr) or cur_atr == 0:
             null_signal.reason = "Indicator NaN"
+            logger.debug("ENTRY SKIP: Indicator NaN")
             return null_signal
 
         reasons = []
@@ -490,6 +493,14 @@ class AnalysisEngine:
             null_signal.volume_ratio = vol_ratio
             null_signal.vwap_value = cur_vwap
             null_signal.atr_value = cur_atr
+            
+            # Additional debug context for the user to understand why it skipped
+            logger.debug(
+                f"ENTRY SKIP [{macro_bias}]: "
+                f"RSI={cur_rsi:.1f}, MACD={cur_hist:.5f}, "
+                f"Vol Ratio={vol_ratio:.2f}x, Price={cur_price:.2f}, "
+                f"VWAP={cur_vwap:.2f} | Valid reasons met: {' | '.join(reasons) if reasons else 'None'}"
+            )
             return null_signal
 
         signal = EntrySignal(

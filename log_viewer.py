@@ -13,10 +13,35 @@ import json
 import html
 import re
 import sys
+import base64
+import secrets
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
+# ── Load Envs ──
+from dotenv import load_dotenv
+load_dotenv()
+
+EXPECTED_USERNAME = os.getenv("WEB_USERNAME")
+EXPECTED_PASSWORD = os.getenv("WEB_PASSWORD")
+
+if not EXPECTED_USERNAME or not EXPECTED_PASSWORD:
+    print("ERROR: WEB_USERNAME and/or WEB_PASSWORD environment variables are missing.")
+    print("Please set them in your .env file to secure the log viewer.")
+    sys.exit(1)
+
+# Generate a base64 encoded expected header once for efficient comparison
+EXPECTED_AUTH_HEADER = "Basic " + base64.b64encode(f"{EXPECTED_USERNAME}:{EXPECTED_PASSWORD}".encode("utf-8")).decode("utf-8")
+
+# ── Anti-Brute-Force rate limiting ──
+# Store IP -> {"failed_attempts": int, "lockout_until": float}
+RATE_LIMIT_STORE = {}
+MAX_FAILED_ATTEMPTS = 5
+LOCKOUT_DURATION_SECONDS = 15 * 60  # 15 minutes
+
 LOG_DIR = Path(__file__).parent / "logs"
+KILL_SWITCH_FILE = Path(__file__).parent / "kill_switch.json"
 PORT = 8777
 
 # ── Colors for log levels ──
@@ -97,10 +122,110 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
 
   .status-dot.paused { background: var(--yellow); animation: none; }
+  .status-dot.killed { background: var(--red); animation: pulse-red 1s ease-in-out infinite; }
 
   @keyframes pulse {
     0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(48,209,88,0.4); }
     50% { opacity: 0.8; box-shadow: 0 0 0 6px rgba(48,209,88,0); }
+  }
+
+  @keyframes pulse-red {
+    0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(255,45,85,0.6); }
+    50% { opacity: 0.7; box-shadow: 0 0 0 8px rgba(255,45,85,0); }
+  }
+
+  /* ── Kill Switch ── */
+  .kill-switch-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 12px;
+    border-radius: 8px;
+    transition: all 0.3s;
+  }
+
+  .kill-switch-wrapper.active {
+    background: rgba(255,45,85,0.12);
+  }
+
+  .kill-switch-label {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    user-select: none;
+    transition: color 0.3s;
+  }
+
+  .kill-switch-wrapper.active .kill-switch-label {
+    color: var(--red);
+    animation: pulse-red 1.5s ease-in-out infinite;
+  }
+
+  .kill-toggle {
+    position: relative;
+    width: 44px;
+    height: 24px;
+    cursor: pointer;
+  }
+
+  .kill-toggle input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+  }
+
+  .kill-slider {
+    position: absolute;
+    inset: 0;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    transition: all 0.3s;
+  }
+
+  .kill-slider::before {
+    content: '';
+    position: absolute;
+    width: 18px;
+    height: 18px;
+    left: 2px;
+    bottom: 2px;
+    background: var(--text-dim);
+    border-radius: 50%;
+    transition: all 0.3s;
+  }
+
+  .kill-toggle input:checked + .kill-slider {
+    background: rgba(255,45,85,0.3);
+    border-color: var(--red);
+  }
+
+  .kill-toggle input:checked + .kill-slider::before {
+    transform: translateX(20px);
+    background: var(--red);
+    box-shadow: 0 0 8px rgba(255,45,85,0.6);
+  }
+
+  /* ── Kill Switch Banner ── */
+  .kill-banner {
+    display: none;
+    padding: 8px 20px;
+    background: linear-gradient(90deg, rgba(255,45,85,0.15), rgba(255,69,58,0.08));
+    border-bottom: 1px solid rgba(255,45,85,0.3);
+    text-align: center;
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--red);
+    letter-spacing: 1px;
+    animation: pulse-red 2s ease-in-out infinite;
+  }
+
+  .kill-banner.visible {
+    display: block;
   }
 
   .header-right {
@@ -300,6 +425,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <span class="refresh-info" id="lastUpdate">Connecting...</span>
   </div>
   <div class="header-right">
+    <div class="kill-switch-wrapper" id="killSwitchWrapper">
+      <span class="kill-switch-label" id="killLabel">Kill Switch</span>
+      <label class="kill-toggle">
+        <input type="checkbox" id="killSwitch" onchange="toggleKillSwitch(this)">
+        <span class="kill-slider"></span>
+      </label>
+    </div>
     <label style="display:flex;align-items:center;gap:6px;color:var(--text-dim);font-size:11px;cursor:pointer">
       <input type="checkbox" id="autoScroll" checked style="accent-color:var(--green)"> Auto-scroll
     </label>
@@ -312,6 +444,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <button class="btn" onclick="fetchLogs()">Refresh</button>
   </div>
 </div>
+
+<div class="kill-banner" id="killBanner">⚠️ KILL SWITCH ACTIVE — All positions liquidated, trading halted</div>
 
 <div class="tabs">
   <div class="tab active" data-file="hydra.log" onclick="switchTab(this)">
@@ -467,9 +601,13 @@ async function fetchLogs() {
     document.getElementById('lastUpdate').textContent = 'Updated ' + now.toLocaleTimeString();
 
     if (data.bot_alive) {
-      dot.className = 'status-dot';
+      if (!document.getElementById('killSwitch').checked) {
+        dot.className = 'status-dot';
+      }
     } else {
-      dot.className = 'status-dot paused';
+      if (!document.getElementById('killSwitch').checked) {
+        dot.className = 'status-dot paused';
+      }
     }
 
     renderLogs();
@@ -487,8 +625,63 @@ function startAutoRefresh() {
 
 document.getElementById('refreshRate').addEventListener('change', startAutoRefresh);
 
+async function fetchKillSwitch() {
+  try {
+    const res = await fetch('/api/killswitch');
+    const data = await res.json();
+    const cb = document.getElementById('killSwitch');
+    const wrapper = document.getElementById('killSwitchWrapper');
+    const banner = document.getElementById('killBanner');
+    const label = document.getElementById('killLabel');
+    const dot = document.getElementById('statusDot');
+
+    cb.checked = data.active;
+    if (data.active) {
+      wrapper.classList.add('active');
+      banner.classList.add('visible');
+      label.textContent = '⚠️ KILL';
+      dot.className = 'status-dot killed';
+    } else {
+      wrapper.classList.remove('active');
+      banner.classList.remove('visible');
+      label.textContent = 'Kill Switch';
+    }
+  } catch(e) { /* silent */ }
+}
+
+async function toggleKillSwitch(el) {
+  const activate = el.checked;
+  const msg = activate
+    ? '⚠️ ACTIVAR KILL SWITCH?\n\nEsto liquidará TODAS las posiciones abiertas, repagará toda la deuda y detendrá el trading.\n\n¿Estás seguro?'
+    : 'Desactivar Kill Switch?\n\nEl bot volverá a operar con normalidad.';
+
+  if (!confirm(msg)) {
+    el.checked = !activate;
+    return;
+  }
+
+  try {
+    const res = await fetch('/api/killswitch', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({active: activate})
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      alert('Error: ' + (data.error || 'unknown'));
+      el.checked = !activate;
+    } else {
+      fetchKillSwitch();
+    }
+  } catch(e) {
+    alert('Error de conexion: ' + e.message);
+    el.checked = !activate;
+  }
+}
+
 // Init
 fetchLogs();
+fetchKillSwitch();
 startAutoRefresh();
 </script>
 
@@ -502,17 +695,68 @@ class LogViewerHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress default logging
 
+    def _is_authenticated(self):
+        client_ip = self.client_address[0]
+        now = time.time()
+        
+        # Check if IP is locked out
+        ip_state = RATE_LIMIT_STORE.get(client_ip, {"failed_attempts": 0, "lockout_until": 0})
+        if now < ip_state["lockout_until"]:
+            return False  # Still locked out
+            
+        auth_header = self.headers.get("Authorization")
+        if not auth_header:
+            return False
+            
+        # Secure comparison using secrets module to prevent timing attacks
+        authenticated = secrets.compare_digest(auth_header.encode('utf-8'), EXPECTED_AUTH_HEADER.encode('utf-8'))
+        
+        if authenticated:
+            # Reset rate limit counter on success
+            RATE_LIMIT_STORE[client_ip] = {"failed_attempts": 0, "lockout_until": 0}
+            return True
+        else:
+            # Increment failed attempts
+            ip_state["failed_attempts"] += 1
+            if ip_state["failed_attempts"] >= MAX_FAILED_ATTEMPTS:
+                ip_state["lockout_until"] = now + LOCKOUT_DURATION_SECONDS
+                print(f"[SECURITY] IP {client_ip} locked out for 15 minutes due to multiple failed login attempts.")
+            
+            RATE_LIMIT_STORE[client_ip] = ip_state
+            # Introduce artificial delay to slow down brute force (tarpitting)
+            time.sleep(1.0 + (ip_state["failed_attempts"] * 0.5))
+            return False
+            
+    def _require_auth(self):
+        self.send_response(401)
+        self.send_header('WWW-Authenticate', 'Basic realm="Hydra Log Viewer Secure Area"')
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        self.wfile.write(b"401 Unauthorized")
+
     def do_GET(self):
+        if not self._is_authenticated():
+            self._require_auth()
+            return
+            
         if self.path == "/":
             self._serve_html()
         elif self.path == "/api/logs":
             self._serve_logs()
+        elif self.path == "/api/killswitch":
+            self._get_kill_switch()
         else:
             self.send_error(404)
 
     def do_POST(self):
+        if not self._is_authenticated():
+            self._require_auth()
+            return
+            
         if self.path == "/api/wipe":
             self._wipe_log()
+        elif self.path == "/api/killswitch":
+            self._set_kill_switch()
         else:
             self.send_error(404)
 
@@ -586,6 +830,36 @@ class LogViewerHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(data.encode("utf-8"))
+
+    def _get_kill_switch(self):
+        """Return current kill switch state."""
+        state = {"active": False}
+        try:
+            if KILL_SWITCH_FILE.exists():
+                state = json.loads(KILL_SWITCH_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        self._json_response(200, state)
+
+    def _set_kill_switch(self):
+        """Toggle the kill switch state."""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length > 0 else {}
+            active = body.get("active", False)
+
+            from datetime import datetime, timezone
+            state = {
+                "active": active,
+                "activated_at": datetime.now(timezone.utc).isoformat() if active else None,
+                "activated_by": "web_ui",
+            }
+            KILL_SWITCH_FILE.write_text(
+                json.dumps(state, indent=2), encoding="utf-8"
+            )
+            self._json_response(200, {"ok": True, "active": active})
+        except Exception as e:
+            self._json_response(500, {"ok": False, "error": str(e)})
 
 
 def main():
